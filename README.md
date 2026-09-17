@@ -1,5 +1,17 @@
 # DetFirmware
 
+## safety1 控制保护
+
+当前源码身份增加 `CAP=WATCHDOG1`。首次控制先发 `WATCHDOG:ARM`（会停止全部输出），随后主机每 500 ms 发送 `WATCHDOG:KEEPALIVE`；超过 3000 ms 无心跳停止开环、PID、校准、PID 测试和进样泵，并保持故障锁存。迟到心跳不会恢复执行；需新控制会话重新 ARM 并显式发起任务。`STOPALL` 始终可用。诊断只读命令仍可在未 ARM 时查询。
+
+必须与更新后的 ROS/Windows 上位机成套使用；手动终端调试运动也必须维护心跳，不能照旧只发送一次长运动命令。该软件保护不替代独立硬件断电手段。
+
+FULL 压测分光帧使用 bit4 (`0x10`) 标记测试数据且清除有效 bit0，禁止写入真实实验记录。二进制长度不变。平台和 TMCStepper 已锁定为本仓库验证基线 6.10.0 / 0.7.3。
+
+新增宿主逻辑回归：Linux/WSL `python3 -B tests/test_control_watchdog_native.py`。它验证超时、锁存、时钟回绕，不验证电气/机械停止时间；上板前仍须进行断线及负载台架测试。
+
+PID 测试轮间等待采用非阻塞调度，期间继续处理心跳和 STOPALL；到期/停机撤销尚未启动的下一轮。Linux/WSL `python3 -B tests/test_pid_test_scheduling_native.py` 提取实际固件函数验证该调度路径，不能替代真实设备负载测试。
+
 水质监测无人船检测装置的 ESP32 固件，面向固件开发、串口联调和硬件维护。
 负责 X/Y/Z/A 四路步进泵、进样泵 PWM、MT6701 角度反馈、ADS122C04 分光采样及健康遥测。
 污染物浓度、历史记录、任务编排和地图展示由 ROS/Web 或 Windows 上位机负责。
@@ -36,7 +48,7 @@ Arduino 框架，声明的外部库为 `teemuatlut/TMCStepper`。
 
 本次迁移环境：PlatformIO Core 6.1.19、Espressif32 6.10.0、
 Arduino-ESP32 包 `3.20017.241212+sha.dcc1105b`、TMCStepper 0.7.3。
-当前配置未锁定平台及库版本；这些是验证环境记录，不是所有新环境都会解析到的版本。
+当前配置已锁定平台及 TMCStepper 版本；框架/工具链解析结果仍应随发布清单记录。
 升级工具链后必须重新编译、测试和上板验证。
 
 ### 烧录与串口
