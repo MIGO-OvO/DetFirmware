@@ -10,6 +10,11 @@
 #include "i2c_mux.h"
 #include "ads122c04.h"
 #include "protocol_packets.h"
+#include "control_watchdog.h"
+
+ControlWatchdog g_controlWatchdog;
+void stopAllOutputs();
+void checkControlWatchdog();
 
 // ============== PID 参数定义（可由上位机配置�?==============
 float g_pidKp = 0.14f;            // 比例系数
@@ -38,7 +43,7 @@ float g_pidOutputMax = 6.0f;      // 最大输�?
 #define PID_PACKET_INTERVAL 20  // 50Hz 数据包发送间�?
 
 #define DET_FIRMWARE_ID "USV_DETECTOR"
-#define DET_FIRMWARE_VERSION "2026.07.24"
+#define DET_FIRMWARE_VERSION "2026.09.17-safety1"
 #define COMMS_TASK_DELAY_MS 5
 #define SENSOR_TASK_DELAY_ACTIVE_MS 5
 #define SENSOR_TASK_DELAY_IDLE_MS 20
@@ -135,9 +140,11 @@ struct PIDTestData {
     uint8_t zeroCrossCount;         // 过零次数
     bool hasConverged;              // 是否已收�?
     unsigned long convergenceTime;  // 收敛时刻
+    bool waitingForNextRun;         // Non-blocking settling interval between runs
+    uint32_t waitStartedMs;
 };
 
-PIDTestData pidTest = {false, 0, 0, 0, 0, 0, 0, 0, {}, {}, 0, 0, 0, 0, 0, 0, false, 0};
+PIDTestData pidTest = {};
 
 // 评分权重配置
 struct ScoreWeights {
@@ -629,6 +636,7 @@ void TaskComms(void *pvParameters) {
     calCtx.motorMask = 0;
 
     while(true) {
+        checkControlWatchdog();
         while(Serial.available()) {
             char c = Serial.read();
             if(c == '\n') {
@@ -636,8 +644,30 @@ void TaskComms(void *pvParameters) {
                 if(commandOverflow) {
                     commandOverflow = false;
                 } else if(inputBuffer.length() > 0) {
+                    checkControlWatchdog();
                     if (inputBuffer == "DET?" || inputBuffer == "HELLO?") {
                         sendIdentity();
+                    }
+                    else if (inputBuffer == "WATCHDOG:ARM") {
+                        stopAllOutputs();
+                        g_controlWatchdog.arm(millis());
+                        Serial.println("WATCHDOG_OK:ARM");
+                    }
+                    else if (inputBuffer == "WATCHDOG:KEEPALIVE") {
+                        g_controlWatchdog.keepalive(millis());
+                    }
+                    else if (inputBuffer == "STOPALL") {
+                        stopAllOutputs();
+                        Serial.println("STOPALL_OK");
+                    }
+                    else if (!g_controlWatchdog.allows_control() &&
+                             inputBuffer != "I2CMAP?" && inputBuffer != "ADSSTATUS?" &&
+                             inputBuffer != "STRESS:STATUS?" && inputBuffer != "PIDQUERY" &&
+                             inputBuffer != "PUMP:STATUS" && inputBuffer != "CALSTATUS" &&
+                             inputBuffer != "PUMP:OFF" && inputBuffer != "PIDSTOP" &&
+                             inputBuffer != "CALSTOP" && inputBuffer != "PIDTESTSTOP" &&
+                             inputBuffer != "ADSSTOP" && inputBuffer != "ANGLESTREAM_STOP") {
+                        Serial.println("WATCHDOG_ERR:REARM_REQUIRED");
                     }
                     // ===== 新增：PID参数配置指令 =====
                     else if (inputBuffer.startsWith("PIDCFG:")) {
@@ -1163,7 +1193,7 @@ void sendVirtualStressAnglePacket() {
 void sendVirtualStressSpectroPacket() {
     unsigned long now = millis();
     int32_t rawCode = (int32_t)((g_stressVirtualSampleCounter * 7919UL + now) % 200000UL) - 100000;
-    uint8_t status = SPECTRO_STATUS_VALID;
+    uint8_t status = SPECTRO_STATUS_TEST;
 
     g_lastSpectroRawCode = rawCode;
     g_lastSpectroVoltage = codeToVoltage(rawCode, 3.3f, 1.0f);
@@ -1465,6 +1495,7 @@ void parsePIDTest(String cmd) {
 // ============== PID测试模式实现 ==============
 void initPIDTest(uint8_t motorIndex, float targetAngle, bool direction, uint8_t runs) {
     pidTest.active = true;
+    pidTest.waitingForNextRun = false;
     pidTest.motorIndex = motorIndex;
     pidTest.targetAngle = targetAngle;
     pidTest.direction = direction;
@@ -1561,6 +1592,7 @@ void startNextTestRun() {
 void stopPIDTest() {
     if (pidTest.active) {
         pidTest.active = false;
+        pidTest.waitingForNextRun = false;
         if (xSemaphoreTake(motorMutex, portMAX_DELAY) == pdTRUE) {
             stopPIDMove(pidTest.motorIndex);
             xSemaphoreGive(motorMutex);
@@ -1572,9 +1604,20 @@ void stopPIDTest() {
 
 void runPIDTestSampling() {
     if (!pidTest.active) return;
+    checkControlWatchdog();
+    if (!g_controlWatchdog.allows_control() || !pidTest.active) return;
 
     MotorState* m = &motors[pidTest.motorIndex];
     unsigned long now = millis();
+
+    if (pidTest.waitingForNextRun) {
+        if (uint32_t(now - pidTest.waitStartedMs) >= 2000U) {
+            pidTest.waitingForNextRun = false;
+            pidTest.currentRun++;
+            startNextTestRun();
+        }
+        return;
+    }
 
     // 检查PID是否完成
     if (!m->isPIDMode) {
@@ -1582,9 +1625,10 @@ void runPIDTestSampling() {
         finishTestRun();
 
         // 等待一段时间后开始下一轮（连续正转，不返回�?
-        delay(2000);  // 确保电机完全稳定
-        pidTest.currentRun++;
-        startNextTestRun();
+        // Return to TaskComms so keepalives, STOPALL and watchdog expiry remain
+        // serviceable throughout the settling interval.
+        pidTest.waitingForNextRun = true;
+        pidTest.waitStartedMs = uint32_t(now);
         return;
     }
 
@@ -1912,7 +1956,29 @@ void sendHealthPacket() {
 }
 
 void sendIdentity() {
-    Serial.printf("DET_ID:%s,FW=%s,BAUD=%lu\n", DET_FIRMWARE_ID, DET_FIRMWARE_VERSION, (unsigned long)115200);
+    Serial.printf("DET_ID:%s,FW=%s,BAUD=%lu,CAP=WATCHDOG1\n", DET_FIRMWARE_ID, DET_FIRMWARE_VERSION, (unsigned long)115200);
+}
+
+void stopAllOutputs() {
+    if (xSemaphoreTake(motorMutex, portMAX_DELAY) == pdTRUE) {
+        pidTest.active = false;
+        pidTest.waitingForNextRun = false;
+        stopCalibration();
+        stopAllPIDMoves();
+        for (int i = 0; i < 4; i++) {
+            motors[i].waitingToSend = false;
+            motors[i].justFinished = false;
+        }
+        setPumpEnabled(false);
+        xSemaphoreGive(motorMutex);
+    }
+}
+
+void checkControlWatchdog() {
+    if (g_controlWatchdog.tick(millis())) {
+        stopAllOutputs();
+        Serial.println("WATCHDOG_TRIPPED");
+    }
 }
 
 float rpmToInterval(float rpm) {

@@ -64,6 +64,7 @@ typedef struct {
 //   bit1: I2C 访问失败
 //   bit2: 配置未完成
 //   bit3: 数据饱和或越界
+//   bit4: 合成测试数据，不能作为真实测量（bit0 必须清零）
 typedef struct {
     uint8_t  head1;         // 0x55
     uint8_t  head2;         // 0xDD
@@ -109,6 +110,7 @@ static_assert(sizeof(SystemHealthPacket) == 37, "SystemHealthPacket must be 37 b
 #define SPECTRO_STATUS_I2C_ERROR    0x02
 #define SPECTRO_STATUS_NOT_CONFIG   0x04
 #define SPECTRO_STATUS_SATURATED    0x08
+#define SPECTRO_STATUS_TEST         0x10
 
 // ============== 分光包大小 ==============
 #define PACKET_SIZE_PID     29
