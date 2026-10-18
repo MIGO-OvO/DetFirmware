@@ -203,7 +203,7 @@ inline bool adsInitAndStart(ADSConfig &cfg) {
  */
 inline bool adsStop(ADSConfig &cfg) {
     if (!selectTcaChannel(cfg.tcaChannel)) return false;
-    adsSendCommand(cfg.address, ADS_CMD_POWERDOWN);
+    if (!adsSendCommand(cfg.address, ADS_CMD_POWERDOWN)) return false;
     cfg.running = false;
     return true;
 }

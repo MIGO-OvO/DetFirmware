@@ -1,5 +1,13 @@
 # DetFirmware
 
+## ADS 启停事务（2026-10 跨端修复）
+
+`ADSSTART` 的通道选择、RESET 延时、寄存器配置、START 全程持有 I²C 互斥锁，避免角度任务在中途切换通道。`ADSSTOP` 仅在通道切换和 POWERDOWN 均成功时回 `ADS_OK:STOP`；失败为 `ADS_ERR:STOP_I2C` 或 `ADS_ERR:STOP_MUTEX_TIMEOUT`，停止轮询不代表 ADC 已关机。
+
+`ADSSTATUS?` 返回 RUNNING / STOPPED / UNKNOWN，并包含 `POLLING`、`STOP_CONFIRMED`；只有真实停机成功后才是 STOPPED。ROS 与 Windows 上位机必须使用匹配解析版本。重复 STOP 可重试确认，失败不得伪报成功。板端 30 秒 `PID_MOVE_TIMEOUT` 未改变，不能用 ROS 的 120 秒等待预算代替。
+
+Linux/WSL：`python3 -B tests/test_ads_i2c_interleaving.py` 覆盖并发切通道、互斥/I²C 失败和重复/恢复停止；宿主测试及编译不替代上板与物理停机验收。
+
 ## safety1 控制保护
 
 当前源码身份增加 `CAP=WATCHDOG1`。首次控制先发 `WATCHDOG:ARM`（会停止全部输出），随后主机每 500 ms 发送 `WATCHDOG:KEEPALIVE`；超过 3000 ms 无心跳停止开环、PID、校准、PID 测试和进样泵，并保持故障锁存。迟到心跳不会恢复执行；需新控制会话重新 ARM 并显式发起任务。`STOPALL` 始终可用。诊断只读命令仍可在未 ARM 时查询。
