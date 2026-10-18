@@ -202,6 +202,7 @@ uint8_t g_spectroChannel = 2;
 // ============== ADS122C04 全局状�?==============
 ADSConfig g_adsConfig;
 volatile bool g_spectroRunning = false;
+bool g_adsStopConfirmed = false;  // Polling stopped is not proof of ADC POWERDOWN.
 uint32_t g_nextSpectroDueMs = 0;
 int32_t g_lastSpectroRawCode = 0;
 float g_lastSpectroVoltage = 0.0f;
@@ -766,9 +767,14 @@ void TaskComms(void *pvParameters) {
                         parseADSConfigCommand(inputBuffer, g_adsConfig);
                     }
                     else if (inputBuffer == "ADSSTART") {
+                        g_adsStopConfirmed = false;
+                        g_adsConfig.running = false;
+                        g_spectroRunning = false;
                         if (!g_adsConfig.enabled) {
                             Serial.println("ADS_ERR:CONFIG");
-                        } else {
+                        } else if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(I2C_SPECTRO_TAKE_TIMEOUT_MS)) == pdTRUE) {
+                            // Keep channel selection, RESET delay, registers and
+                            // START in one bus transaction against TaskSensors.
                             invalidateTcaCache();
                             if (selectTcaChannel(g_adsConfig.tcaChannel)) {
                                 if (adsInitAndStart(g_adsConfig)) {
@@ -787,18 +793,30 @@ void TaskComms(void *pvParameters) {
                                 Serial.println("ADS_ERR:I2C");
                             }
                             invalidateTcaCache();
+                            xSemaphoreGive(i2cMutex);
+                        } else {
+                            Serial.println("ADS_ERR:MUTEX_TIMEOUT");
                         }
                     }
                     else if (inputBuffer == "ADSSTOP") {
-                        adsStop(g_adsConfig);
                         g_spectroRunning = false;
-                        Serial.println("ADS_OK:STOP");
+                        g_adsStopConfirmed = false;
+                        if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(I2C_SPECTRO_TAKE_TIMEOUT_MS)) == pdTRUE) {
+                            invalidateTcaCache();
+                            g_adsStopConfirmed = adsStop(g_adsConfig);
+                            invalidateTcaCache();
+                            xSemaphoreGive(i2cMutex);
+                            Serial.println(g_adsStopConfirmed ? "ADS_OK:STOP" : "ADS_ERR:STOP_I2C");
+                        } else {
+                            Serial.println("ADS_ERR:STOP_MUTEX_TIMEOUT");
+                        }
                     }
                     else if (inputBuffer == "ADSSTATUS?") {
-                        Serial.printf("ADS_STATUS:%s,CH=%d,ADDR=0x%02X,DR=%d,GAIN=%d,REF=%s\n",
-                            g_spectroRunning ? "RUNNING" : "STOPPED",
+                        Serial.printf("ADS_STATUS:%s,CH=%d,ADDR=0x%02X,DR=%d,GAIN=%d,REF=%s,POLLING=%d,STOP_CONFIRMED=%d\n",
+                            g_spectroRunning ? "RUNNING" : (g_adsStopConfirmed ? "STOPPED" : "UNKNOWN"),
                             g_adsConfig.tcaChannel, g_adsConfig.address, g_adsConfig.adcRate,
-                            g_adsConfig.gain, g_adsConfig.vrefMode == ADS_VREF_AVDD ? "AVDD" : "INT");
+                            g_adsConfig.gain, g_adsConfig.vrefMode == ADS_VREF_AVDD ? "AVDD" : "INT",
+                            g_spectroRunning ? 1 : 0, g_adsStopConfirmed ? 1 : 0);
                     }
                     // ===== 角度流控制指令 =====
                     else if (inputBuffer == "ANGLESTREAM_START") {
