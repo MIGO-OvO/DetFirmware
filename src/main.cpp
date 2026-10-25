@@ -37,13 +37,15 @@ float g_pidOutputMax = 6.0f;      // 最大输�?
 #define CAL_STABLE_COUNT 15
 #define CAL_INTERVAL 20
 
-#define PID_MOVE_TIMEOUT 30000
+#define PID_MOVE_TIMEOUT 600000UL
+#define PID_SETTLE_TIMEOUT 180000UL
+#define PID_SETTLE_ZONE_DEG 10.0f
 #define PID_MOVE_STABLE_COUNT 10
 
 #define PID_PACKET_INTERVAL 20  // 50Hz 数据包发送间�?
 
 #define DET_FIRMWARE_ID "USV_DETECTOR"
-#define DET_FIRMWARE_VERSION "2026.09.17-safety1"
+#define DET_FIRMWARE_VERSION "2026.10.25-pid-phases1"
 #define COMMS_TASK_DELAY_MS 5
 #define SENSOR_TASK_DELAY_ACTIVE_MS 5
 #define SENSOR_TASK_DELAY_IDLE_MS 20
@@ -294,6 +296,15 @@ struct MotorState {
     // 速度斜坡控制
     float lastOutputRPM;
 
+    bool pidSettling;
+    uint32_t pidSettleStartTime;
+
+    void beginPIDTiming(uint32_t now) {
+        pidStartTime = now;
+        pidSettling = false;
+        pidSettleStartTime = 0;
+    }
+
     // 重置解环角度（防溢出�?
     void resetAbsAngle(float currentRaw) {
         absAngle = 0.0f;
@@ -303,10 +314,10 @@ struct MotorState {
 };
 
 MotorState motors[4] = {
-    {false, true, false, 0, 0, 0, false, 0, 0, 0, 0, 0, 0, true, false, 0, false, false, 0, 0.1f, 0, 0, 0, {}, 0, 0, 0, false, 0, 0, 0, 0, 0},
-    {false, true, false, 0, 0, 0, false, 0, 0, 0, 0, 0, 0, true, false, 0, false, false, 0, 0.1f, 0, 0, 0, {}, 0, 0, 0, false, 0, 0, 0, 0, 0},
-    {false, true, false, 0, 0, 0, false, 0, 0, 0, 0, 0, 0, true, false, 0, false, false, 0, 0.1f, 0, 0, 0, {}, 0, 0, 0, false, 0, 0, 0, 0, 0},
-    {false, true, false, 0, 0, 0, false, 0, 0, 0, 0, 0, 0, true, false, 0, false, false, 0, 0.1f, 0, 0, 0, {}, 0, 0, 0, false, 0, 0, 0, 0, 0}
+    {false, true, false, 0, 0, 0, false, 0, 0, 0, 0, 0, 0, true, false, 0, false, false, 0, 0.1f, 0, 0, 0, {}, 0, 0, 0, false, 0, 0, 0, 0, 0, false, 0},
+    {false, true, false, 0, 0, 0, false, 0, 0, 0, 0, 0, 0, true, false, 0, false, false, 0, 0.1f, 0, 0, 0, {}, 0, 0, 0, false, 0, 0, 0, 0, 0, false, 0},
+    {false, true, false, 0, 0, 0, false, 0, 0, 0, 0, 0, 0, true, false, 0, false, false, 0, 0.1f, 0, 0, 0, {}, 0, 0, 0, false, 0, 0, 0, 0, 0, false, 0},
+    {false, true, false, 0, 0, 0, false, 0, 0, 0, 0, 0, 0, true, false, 0, false, false, 0, 0.1f, 0, 0, 0, {}, 0, 0, 0, false, 0, 0, 0, 0, 0, false, 0}
 };
 
 const byte motorPins[4][2] = {
@@ -1579,7 +1590,7 @@ void startNextTestRun() {
         m->pidPrecision = 0.1f;
         m->pidStableCount = 0;
         m->pidSensorErrCount = 0;
-        m->pidStartTime = millis();
+        m->beginPIDTiming(millis());
         m->pidInitialAngle = pidTest.initialAngle;
         m->pidStartSteps = m->executedSteps;
         m->pidStartSignedSteps = m->signedSteps;
@@ -2203,7 +2214,7 @@ void parseCommand(String cmd) {
             m->pidPrecision = precision;
             m->pidStableCount = 0;
             m->pidSensorErrCount = 0;
-            m->pidStartTime = millis();
+            m->beginPIDTiming(millis());
 
             // 使用全局可配置的PID参数
             m->pidCtrl.Kp = g_pidKp;
@@ -2674,7 +2685,7 @@ void initPIDMove(int motorIndex, float targetAngle, float precision) {
     m->pidPrecision = precision;
     m->pidStableCount = 0;
     m->pidSensorErrCount = 0;
-    m->pidStartTime = millis();
+    m->beginPIDTiming(millis());
 
     // 使用全局可配置的PID参数
     m->pidCtrl.Kp = g_pidKp;
@@ -2721,7 +2732,7 @@ void runMotorPID() {
         float rawAngle = getCachedAngle(i);
 
         // 传感器错误检�?
-        if (rawAngle < 0 || rawAngle > 360) {
+        if (!isfinite(rawAngle) || rawAngle < 0 || rawAngle > 360) {
             m->pidSensorErrCount++;
             if (m->pidSensorErrCount > 10) {
                 Serial.printf("PID_FAIL:%c=SENSOR_ERR\n", motorNames[i]);
@@ -2747,10 +2758,21 @@ void runMotorPID() {
         float displayAngle = fmod(m->absAngle, 360.0f);
         if (displayAngle < 0) displayAngle += 360.0f;
 
-        // 超时检�?
-        if (now - m->pidStartTime > PID_MOVE_TIMEOUT) {
+        // The first near-target sample starts a per-axis settling clock.
+        // Use unwrapped error: a full turn is not already at its target.
+        uint32_t elapsed = now - m->pidStartTime;
+        if (!m->pidSettling && fabs(error) <= PID_SETTLE_ZONE_DEG) {
+            m->pidSettling = true;
+            m->pidSettleStartTime = now;
+            Serial.printf("PID_SETTLE:%c,err=%.2f,elapsed_ms=%lu\n",
+                motorNames[i], error, (unsigned long)elapsed);
+        }
+        uint32_t settleElapsed = m->pidSettling ? uint32_t(now - m->pidSettleStartTime) : 0;
+        if (elapsed >= PID_MOVE_TIMEOUT || (m->pidSettling && settleElapsed >= PID_SETTLE_TIMEOUT)) {
             sendPIDDataPacket(i, displayAngle, error, 0);
-            Serial.printf("PID_TIMEOUT:%c,abs=%.2f,err=%.2f\n", motorNames[i], m->absAngle, error);
+            Serial.printf("PID_TIMEOUT:%c,abs=%.2f,err=%.2f,phase=%s,elapsed_ms=%lu,settle_ms=%lu\n",
+                motorNames[i], m->absAngle, error, elapsed >= PID_MOVE_TIMEOUT ? "total" : "settling",
+                (unsigned long)elapsed, (unsigned long)settleElapsed);
             if (xSemaphoreTake(motorMutex, portMAX_DELAY) == pdTRUE) {
                 m->isPIDMode = false;
                 m->enabled = false;

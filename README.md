@@ -4,9 +4,19 @@
 
 `ADSSTART` 的通道选择、RESET 延时、寄存器配置、START 全程持有 I²C 互斥锁，避免角度任务在中途切换通道。`ADSSTOP` 仅在通道切换和 POWERDOWN 均成功时回 `ADS_OK:STOP`；失败为 `ADS_ERR:STOP_I2C` 或 `ADS_ERR:STOP_MUTEX_TIMEOUT`，停止轮询不代表 ADC 已关机。
 
-`ADSSTATUS?` 返回 RUNNING / STOPPED / UNKNOWN，并包含 `POLLING`、`STOP_CONFIRMED`；只有真实停机成功后才是 STOPPED。ROS 与 Windows 上位机必须使用匹配解析版本。重复 STOP 可重试确认，失败不得伪报成功。板端 30 秒 `PID_MOVE_TIMEOUT` 未改变，不能用 ROS 的 120 秒等待预算代替。
+`ADSSTATUS?` 返回 RUNNING / STOPPED / UNKNOWN，并包含 `POLLING`、`STOP_CONFIRMED`；只有真实停机成功后才是 STOPPED。ROS 与 Windows 上位机必须使用匹配解析版本。重复 STOP 可重试确认，失败不得伪报成功。
 
 Linux/WSL：`python3 -B tests/test_ads_i2c_interleaving.py` 覆盖并发切通道、互斥/I²C 失败和重复/恢复停止；宿主测试及编译不替代上板与物理停机验收。
+
+## PID 分阶段超时
+
+固件身份为 `2026.10.25-pid-phases1`。每轴单次 PID 最长 600 秒，从运动初始化开始计时。首次有效角度反馈满足解环误差 `abs(absTargetAngle - absAngle) <= 10°` 时，开始独立的 180 秒收敛计时；两项期限先到者停止该轴并报告 `PID_TIMEOUT`。跨圈运动使用连续累积角度，不以 0～360° 显示角判断剩余行程。
+
+小于等于 10° 的运动从首次控制周期进入收敛。误差进入 1°、反向纠偏、离开再进入 10° 或其他轴完成，都不重置时钟。回零、相对 R/PID 和 PID 测试轮次使用相同计时初始化。完成仍要求误差小于命令精度且满足原有 10 周期稳定判据；主机预处理精度为 0.1°。PID 增益、最低输出速度和传感器调度不变。
+
+进入收敛时输出 `PID_SETTLE:A,err=...,elapsed_ms=...`；超时保留原有轴、`abs`、`err`，追加 `phase=total|settling,elapsed_ms=...,settle_ms=...`。文本字段兼容 ROS/Windows 现有解析，二进制帧布局不变。ROS 默认等待 610 秒；部署时同步更新 ROS 与检测板，只有主机更新不能解除旧固件的 30 秒限时。Windows 上位机的独立预处理等待仍为 60 秒，本次未修改该应用。
+
+Linux/WSL：`python3 -B tests/test_pid_move_timeout_native.py` 提取实际运动函数，覆盖慢速多圈、收敛回摆、各轴独立期限、小行程、时钟回绕、STOP 与传感器错误。上板后先验证停止和断线看门狗，再验证低负载慢速行程及 10° 内的收敛。延长等待不代表已经验证带负载收敛性能。
 
 ## safety1 控制保护
 
